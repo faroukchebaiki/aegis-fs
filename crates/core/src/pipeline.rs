@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use uuid::Uuid;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -14,9 +16,12 @@ use crate::db::Database;
 use crate::erasure::Erasure;
 use crate::journal::Journal;
 use crate::model::{
-    DefaultsConfig, FileDetails, FileMeta, FileRecord, JournalStage, VaultFileEntry,
+    AccountRecord, Credential, DefaultsConfig, FileDetails, FileMeta, FileRecord, JournalStage,
+    RemoteRef, RemoteShardRecord, VaultAccountEntry, VaultFileEntry,
 };
 use crate::store::FileStore;
+use crate::storage::httpbucket::{self, HttpBucketStorage};
+use crate::storage::Storage;
 use crate::util::{utc_now, HomePaths};
 use crate::vault::Vault;
 
@@ -35,6 +40,19 @@ pub struct UnpackOptions {
     pub file_id: String,
     pub destination: PathBuf,
     pub overwrite: bool,
+    pub from_remote: bool,
+    pub account: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountListing {
+    pub record: AccountRecord,
+    pub has_token: bool,
+}
+
+struct ResolvedAccount {
+    record: AccountRecord,
+    credential: Credential,
 }
 
 pub struct AegisFs {
@@ -97,6 +115,51 @@ impl AegisFs {
             .set_setting("cache_gb", &cache_gb.to_string())
             .await?;
         Ok(())
+    }
+
+    /// Adds a remote storage account backed by the encrypted vault.
+    pub async fn add_account(
+        &self,
+        password: &str,
+        name: &str,
+        backend: &str,
+        endpoint: &str,
+        token: &str,
+    ) -> Result<i64> {
+        anyhow::ensure!(!name.trim().is_empty(), "account name cannot be empty");
+        self.validate_backend(backend)?;
+
+        let mut vault = self.unlock_vault(password).await?;
+        let token_ref = format!("vault:{}", Uuid::new_v4());
+        let account_id = self
+            .db
+            .create_account(name, backend, endpoint, &token_ref)
+            .await?;
+
+        let entry = VaultAccountEntry {
+            account_id,
+            name: name.to_string(),
+            backend: backend.to_string(),
+            endpoint: endpoint.to_string(),
+            token: token.to_string(),
+            token_ref,
+        };
+        vault.upsert_account(entry).await?;
+        Ok(account_id)
+    }
+
+    /// Lists configured accounts, indicating whether the vault has a stored credential.
+    pub async fn list_accounts(&self, password: &str) -> Result<Vec<AccountListing>> {
+        let vault = self.unlock_vault(password).await?;
+        let accounts = self.db.list_accounts().await?;
+        let listings = accounts
+            .into_iter()
+            .map(|record| AccountListing {
+                has_token: vault.account(record.id).is_some(),
+                record,
+            })
+            .collect();
+        Ok(listings)
     }
 
     /// Retrieves all tracked file records ordered by creation time.
@@ -213,6 +276,70 @@ impl AegisFs {
         Ok(())
     }
 
+    /// Uploads shards for a file to a remote backend.
+    pub async fn upload_shards(
+        &self,
+        password: &str,
+        file_id: &str,
+        account_name: Option<&str>,
+    ) -> Result<()> {
+        let vault = self.unlock_vault(password).await?;
+        let resolved = self
+            .resolve_account(&vault, account_name)
+            .await
+            .context("resolving account")?;
+
+        let storage = self.instantiate_storage(&resolved.record.backend)?;
+        let session = storage.login(&resolved.credential).await?;
+
+        let store = FileStore::new(self.paths.objects_dir.clone());
+        store.ensure_dir(file_id).await?;
+        let meta = store.read_meta(file_id).await?;
+        for shard in &meta.checksums {
+            let shard_path = store.shard_path(file_id, shard.index as usize);
+            if !shard_path.exists() {
+                anyhow::bail!(
+                    "local shard {} missing; run pack before upload",
+                    shard.index
+                );
+            }
+            let hint = format!("{}/shard_{:03}.bin", file_id, shard.index);
+            info!(
+                file_id = %file_id,
+                index = shard.index,
+                "uploading shard to account {}",
+                resolved.record.name
+            );
+            let remote_ref = storage
+                .upload(&session, &shard_path, Some(&hint))
+                .await
+                .with_context(|| format!("uploading shard {}", shard.index))?;
+            let object_meta = storage
+                .stat(&session, &remote_ref)
+                .await
+                .with_context(|| format!("stat remote shard {}", shard.index))?;
+
+            info!(
+                file_id = %file_id,
+                index = shard.index,
+                remote_size = object_meta.size,
+                "remote shard uploaded (checksum {}...)",
+                &shard.checksum[..shard.checksum.len().min(12)]
+            );
+
+            let record = RemoteShardRecord {
+                file_id: file_id.to_string(),
+                index: shard.index,
+                account_id: resolved.record.id,
+                remote_ref: remote_ref.locator.clone(),
+                size: object_meta.size,
+                etag: object_meta.etag.clone(),
+            };
+            self.db.upsert_remote_shard(&record).await?;
+        }
+        Ok(())
+    }
+
     /// Restores a file from shards, repairing missing shards when parity is available.
     ///
     /// # Errors
@@ -221,6 +348,12 @@ impl AegisFs {
         let vault = self.unlock_vault(password).await?;
         let store = FileStore::new(self.paths.objects_dir.clone());
         let meta = store.read_meta(&options.file_id).await?;
+
+        if options.from_remote {
+            self.ensure_remote_shards(&vault, &meta, options.account.as_deref())
+                .await?;
+        }
+
         let entry = vault
             .data
             .find(&options.file_id)
@@ -301,9 +434,253 @@ impl AegisFs {
         Ok(())
     }
 
+    /// Removes remote shards for a file across matching accounts.
+    pub async fn gc_remote(
+        &self,
+        password: &str,
+        file_id: &str,
+        account_name: Option<&str>,
+    ) -> Result<()> {
+        let vault = self.unlock_vault(password).await?;
+        let mut remote_records = self.db.list_remote_shards(file_id).await?;
+        if remote_records.is_empty() {
+            anyhow::bail!("no remote shards recorded for {}", file_id);
+        }
+
+        if let Some(name) = account_name {
+            let account = self
+                .db
+                .get_account_by_name(name)
+                .await?
+                .ok_or_else(|| anyhow!("account '{}' not found", name))?;
+            remote_records.retain(|record| record.account_id == account.id);
+            if remote_records.is_empty() {
+                anyhow::bail!(
+                    "no remote shards for {} stored on account '{}'",
+                    file_id,
+                    name
+                );
+            }
+        }
+
+        let mut by_account: HashMap<i64, Vec<RemoteShardRecord>> = HashMap::new();
+        for record in remote_records {
+            by_account.entry(record.account_id).or_default().push(record);
+        }
+
+        for (account_id, entries) in by_account {
+            let account_record = self
+                .db
+                .get_account_by_id(account_id)
+                .await?
+                .ok_or_else(|| anyhow!("account id {} missing", account_id))?;
+            let vault_entry = vault
+                .account(account_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "credentials for account '{}' missing from vault",
+                        account_record.name
+                    )
+                })?;
+
+            let credential = Credential {
+                account_id,
+                backend: account_record.backend.clone(),
+                endpoint: account_record.endpoint.clone(),
+                token: vault_entry.token.clone(),
+                token_ref: vault_entry.token_ref.clone(),
+            };
+
+            let storage = self.instantiate_storage(&account_record.backend)?;
+            let session = storage.login(&credential).await?;
+
+            for entry in entries {
+                let remote = RemoteRef {
+                    backend: account_record.backend.clone(),
+                    locator: entry.remote_ref.clone(),
+                    etag: entry.etag.clone(),
+                };
+                storage
+                    .delete(&session, &remote)
+                    .await
+                    .with_context(|| format!("deleting remote shard {}", entry.index))?;
+                self.db
+                    .delete_remote_shard(file_id, entry.index)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[must_use]
     pub fn home(&self) -> &HomePaths {
         &self.paths
+    }
+
+    fn validate_backend(&self, backend: &str) -> Result<()> {
+        match backend {
+            httpbucket::BACKEND_ID => Ok(()),
+            other => Err(anyhow!("unsupported backend '{}'", other)),
+        }
+    }
+
+    fn instantiate_storage(&self, backend: &str) -> Result<Box<dyn Storage>> {
+        match backend {
+            httpbucket::BACKEND_ID => Ok(Box::new(HttpBucketStorage::new()?)),
+            other => Err(anyhow!("unsupported backend '{}'", other)),
+        }
+    }
+
+    async fn resolve_account(
+        &self,
+        vault: &Vault,
+        account_name: Option<&str>,
+    ) -> Result<ResolvedAccount> {
+        let record = if let Some(name) = account_name {
+            self.db
+                .get_account_by_name(name)
+                .await?
+                .ok_or_else(|| anyhow!("account '{}' not found", name))?
+        } else {
+            let mut accounts = self.db.list_accounts().await?;
+            anyhow::ensure!(!accounts.is_empty(), "no remote accounts configured");
+            accounts.remove(0)
+        };
+
+        let vault_entry = vault
+            .account(record.id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no credential stored in vault for account '{}'", record.name))?;
+
+        let credential = Credential {
+            account_id: record.id,
+            backend: record.backend.clone(),
+            endpoint: record.endpoint.clone(),
+            token: vault_entry.token.clone(),
+            token_ref: vault_entry.token_ref.clone(),
+        };
+
+        Ok(ResolvedAccount { record, credential })
+    }
+
+    async fn ensure_remote_shards(
+        &self,
+        vault: &Vault,
+        meta: &FileMeta,
+        account_override: Option<&str>,
+    ) -> Result<()> {
+        let store = FileStore::new(self.paths.objects_dir.clone());
+        store.ensure_dir(&meta.file_id).await?;
+        let mut remote_records = self.db.list_remote_shards(&meta.file_id).await?;
+        if remote_records.is_empty() {
+            anyhow::bail!("no remote shards recorded for {}", meta.file_id);
+        }
+
+        if let Some(name) = account_override {
+            let account = self
+                .db
+                .get_account_by_name(name)
+                .await?
+                .ok_or_else(|| anyhow!("account '{}' not found", name))?;
+            remote_records.retain(|record| record.account_id == account.id);
+            if remote_records.is_empty() {
+                anyhow::bail!(
+                    "no remote shards for {} stored on account '{}'",
+                    meta.file_id,
+                    name
+                );
+            }
+        }
+
+        let mut by_account: HashMap<i64, Vec<RemoteShardRecord>> = HashMap::new();
+        for record in remote_records {
+            by_account.entry(record.account_id).or_default().push(record);
+        }
+
+        for (account_id, entries) in by_account {
+            let account_record = self
+                .db
+                .get_account_by_id(account_id)
+                .await?
+                .ok_or_else(|| anyhow!("account id {} missing", account_id))?;
+            let vault_entry = vault
+                .account(account_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "credentials for account '{}' missing from vault",
+                        account_record.name
+                    )
+                })?;
+
+            let credential = Credential {
+                account_id,
+                backend: account_record.backend.clone(),
+                endpoint: account_record.endpoint.clone(),
+                token: vault_entry.token.clone(),
+                token_ref: vault_entry.token_ref.clone(),
+            };
+
+            let storage = self.instantiate_storage(&account_record.backend)?;
+            let session = storage.login(&credential).await?;
+
+            for entry in entries {
+                let shard_info = meta
+                    .checksums
+                    .iter()
+                    .find(|info| info.index == entry.index)
+                    .ok_or_else(|| anyhow!("metadata missing shard {}", entry.index))?;
+                let shard_path = store.shard_path(&meta.file_id, entry.index as usize);
+                if shard_path.exists() {
+                    let local_meta = fs::metadata(&shard_path).await?;
+                    if local_meta.len() as u64 == entry.size {
+                        continue;
+                    }
+                    info!(
+                        file_id = %meta.file_id,
+                        index = entry.index,
+                        "local shard size mismatch ({} vs {}), refreshing",
+                        local_meta.len(),
+                        entry.size
+                    );
+                }
+
+                let remote = RemoteRef {
+                    backend: account_record.backend.clone(),
+                    locator: entry.remote_ref.clone(),
+                    etag: entry.etag.clone(),
+                };
+                let tmp_path = shard_path.with_extension("remote.part");
+                info!(
+                    file_id = %meta.file_id,
+                    index = entry.index,
+                    "downloading shard from account {}",
+                    account_record.name
+                );
+                storage
+                    .download(&session, &remote, &tmp_path)
+                    .await
+                    .with_context(|| format!("downloading shard {}", entry.index))?;
+                let downloaded = fs::read(&tmp_path).await?;
+                let digest = crypto::blake3_checksum_hex(&downloaded);
+                if digest != shard_info.checksum {
+                    fs::remove_file(&tmp_path).await.ok();
+                    anyhow::bail!(
+                        "checksum mismatch for shard {}: expected {}, got {}",
+                        entry.index,
+                        shard_info.checksum,
+                        digest
+                    );
+                }
+                fs::rename(&tmp_path, &shard_path)
+                    .await
+                    .with_context(|| format!("renaming {}", tmp_path.display()))?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -355,6 +732,8 @@ mod tests {
             file_id: "file1".into(),
             destination: out_file.clone(),
             overwrite: true,
+            from_remote: false,
+            account: None,
         };
         fs.unpack(PASSWORD, unpack_opts).await.unwrap();
 
@@ -390,6 +769,8 @@ mod tests {
             file_id: "file2".into(),
             destination: dir.path().join("restored2.bin"),
             overwrite: true,
+            from_remote: false,
+            account: None,
         };
         fs.unpack(PASSWORD, unpack_opts).await.unwrap();
     }
@@ -428,6 +809,8 @@ mod tests {
                 file_id: "file3".into(),
                 destination: dir.path().join("restored3.bin"),
                 overwrite: true,
+                from_remote: false,
+                account: None,
             },
         )
         .await
@@ -465,6 +848,8 @@ mod tests {
             file_id: "resume".into(),
             destination: dir.path().join("resume.bin"),
             overwrite: true,
+            from_remote: false,
+            account: None,
         };
         fs.unpack(PASSWORD, unpack_opts).await.unwrap();
     }

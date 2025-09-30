@@ -37,12 +37,24 @@ pub struct VaultFileEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VaultAccountEntry {
+    pub account_id: i64,
+    pub name: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub token: String,
+    pub token_ref: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VaultData {
     pub version: u32,
     pub default_k: u8,
     pub default_m: u8,
     pub cache_gb: u32,
     pub files: Vec<VaultFileEntry>,
+    #[serde(default)]
+    pub accounts: Vec<VaultAccountEntry>,
 }
 
 impl VaultData {
@@ -54,6 +66,7 @@ impl VaultData {
             default_m: defaults.m,
             cache_gb: defaults.cache_gb,
             files: Vec::new(),
+            accounts: Vec::new(),
         }
     }
 
@@ -72,6 +85,29 @@ impl VaultData {
     #[must_use]
     pub fn find(&self, file_id: &str) -> Option<&VaultFileEntry> {
         self.files.iter().find(|entry| entry.file_id == file_id)
+    }
+
+    pub fn upsert_account(&mut self, entry: VaultAccountEntry) {
+        if let Some(existing) = self
+            .accounts
+            .iter_mut()
+            .find(|acct| acct.account_id == entry.account_id)
+        {
+            *existing = entry;
+        } else {
+            self.accounts.push(entry);
+        }
+    }
+
+    pub fn remove_account(&mut self, account_id: i64) {
+        self.accounts
+            .retain(|entry| entry.account_id != account_id);
+    }
+
+    pub fn find_account(&self, account_id: i64) -> Option<&VaultAccountEntry> {
+        self.accounts
+            .iter()
+            .find(|entry| entry.account_id == account_id)
     }
 }
 
@@ -112,6 +148,56 @@ pub struct FileRecord {
 pub struct FileDetails {
     pub record: FileRecord,
     pub shards: Vec<ShardInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Credential {
+    pub account_id: i64,
+    pub backend: String,
+    pub endpoint: String,
+    pub token: String,
+    pub token_ref: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Session {
+    pub account_id: i64,
+    pub backend: String,
+    pub endpoint: String,
+    pub token: String,
+    pub token_ref: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteRef {
+    pub backend: String,
+    pub locator: String,
+    pub etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObjectMeta {
+    pub size: u64,
+    pub etag: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountRecord {
+    pub id: i64,
+    pub name: String,
+    pub backend: String,
+    pub endpoint: String,
+    pub token_ref: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteShardRecord {
+    pub file_id: String,
+    pub index: u8,
+    pub account_id: i64,
+    pub remote_ref: String,
+    pub size: u64,
+    pub etag: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

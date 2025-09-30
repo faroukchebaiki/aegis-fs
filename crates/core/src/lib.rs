@@ -9,6 +9,7 @@ pub mod erasure;
 pub mod journal;
 pub mod model;
 pub mod store;
+pub mod storage;
 pub mod util;
 pub mod vault;
 

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use aegis_core::model::DefaultsConfig;
 use aegis_core::store::FileStore;
+use aegis_core::storage::httpbucket;
 use aegis_core::util::resolve_home;
 use aegis_core::{AegisFs, PackOptions, UnpackOptions};
 use anyhow::{Context, Result};
@@ -32,6 +33,13 @@ enum Commands {
     List,
     Show(ShowArgs),
     Rm(RemoveArgs),
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    Upload(UploadArgs),
+    Fetch(FetchArgs),
+    GcRemote(GcRemoteArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -84,6 +92,10 @@ struct UnpackArgs {
     destination: PathBuf,
     #[arg(long)]
     overwrite: bool,
+    #[arg(long = "from-remote")]
+    from_remote: bool,
+    #[arg(long)]
+    account: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -100,6 +112,60 @@ struct RemoveArgs {
     file_id: String,
 }
 
+#[derive(Subcommand, Debug)]
+enum AccountCommand {
+    Add(AccountAddArgs),
+    List,
+}
+
+#[derive(Parser, Debug)]
+struct AccountAddArgs {
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    name: String,
+    #[arg(long, default_value = httpbucket::BACKEND_ID)]
+    backend: String,
+    #[arg(long)]
+    endpoint: String,
+    #[arg(long)]
+    token: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct UploadArgs {
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long = "id")]
+    file_id: String,
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct FetchArgs {
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long = "id")]
+    file_id: String,
+    #[arg(value_name = "DEST")]
+    destination: PathBuf,
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct GcRemoteArgs {
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long = "id")]
+    file_id: String,
+    #[arg(long)]
+    account: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -114,6 +180,10 @@ async fn main() -> Result<()> {
         Commands::List => handle_list(home_paths).await,
         Commands::Show(args) => handle_show(home_paths, args).await,
         Commands::Rm(args) => handle_remove(home_paths, args).await,
+        Commands::Account { command } => handle_account(home_paths, command).await,
+        Commands::Upload(args) => handle_upload(home_paths, args).await,
+        Commands::Fetch(args) => handle_fetch(home_paths, args).await,
+        Commands::GcRemote(args) => handle_gc_remote(home_paths, args).await,
     }
 }
 
@@ -174,6 +244,8 @@ async fn handle_unpack(home_paths: aegis_core::util::HomePaths, args: UnpackArgs
         file_id: args.file_id,
         destination: args.destination,
         overwrite: args.overwrite,
+        from_remote: args.from_remote,
+        account: args.account,
     };
     let path = fs.unpack(password.as_ref(), options).await?;
     println!("Unpacked to {}", path.display());
@@ -221,6 +293,89 @@ async fn handle_remove(home_paths: aegis_core::util::HomePaths, args: RemoveArgs
     let fs = AegisFs::load(home_paths).await?;
     fs.remove(password.as_ref(), &args.file_id).await?;
     println!("Removed {}", args.file_id);
+    Ok(())
+}
+
+async fn handle_account(
+    home_paths: aegis_core::util::HomePaths,
+    cmd: AccountCommand,
+) -> Result<()> {
+    match cmd {
+        AccountCommand::Add(args) => {
+            let mut password = resolve_password("Master password", args.password)?;
+            let token = if let Some(tok) = args.token {
+                Zeroizing::new(tok)
+            } else {
+                Zeroizing::new(prompt_password("Bearer token: ").context("reading token")?)
+            };
+            let fs = AegisFs::load(home_paths).await?;
+            let account_id = fs
+                .add_account(
+                    password.as_ref(),
+                    &args.name,
+                    &args.backend,
+                    &args.endpoint,
+                    token.as_ref(),
+                )
+                .await?;
+            password.zeroize();
+            println!("Account '{}' registered (id {})", args.name, account_id);
+        }
+        AccountCommand::List => {
+            let password = resolve_password("Master password", None)?;
+            let fs = AegisFs::load(home_paths).await?;
+            let accounts = fs.list_accounts(password.as_ref()).await?;
+            if accounts.is_empty() {
+                println!("No remote accounts configured");
+            } else {
+                for entry in accounts {
+                    println!(
+                        "{}\tbackend={}\tendpoint={}\ttoken={}",
+                        entry.record.name,
+                        entry.record.backend,
+                        entry.record.endpoint,
+                        if entry.has_token { "stored" } else { "missing" }
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_upload(home_paths: aegis_core::util::HomePaths, args: UploadArgs) -> Result<()> {
+    let password = resolve_password("Master password", args.password)?;
+    let fs = AegisFs::load(home_paths).await?;
+    fs.upload_shards(password.as_ref(), &args.file_id, args.account.as_deref())
+        .await?;
+    println!("Uploaded shards for {}", args.file_id);
+    Ok(())
+}
+
+async fn handle_fetch(home_paths: aegis_core::util::HomePaths, args: FetchArgs) -> Result<()> {
+    let password = resolve_password("Master password", args.password)?;
+    let fs = AegisFs::load(home_paths.clone()).await?;
+    let options = UnpackOptions {
+        file_id: args.file_id,
+        destination: args.destination,
+        overwrite: args.overwrite,
+        from_remote: true,
+        account: args.account,
+    };
+    let output = fs.unpack(password.as_ref(), options).await?;
+    println!("Fetched and unpacked to {}", output.display());
+    Ok(())
+}
+
+async fn handle_gc_remote(
+    home_paths: aegis_core::util::HomePaths,
+    args: GcRemoteArgs,
+) -> Result<()> {
+    let password = resolve_password("Master password", args.password)?;
+    let fs = AegisFs::load(home_paths).await?;
+    fs.gc_remote(password.as_ref(), &args.file_id, args.account.as_deref())
+        .await?;
+    println!("Removed remote shards for {}", args.file_id);
     Ok(())
 }
 

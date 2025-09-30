@@ -7,7 +7,9 @@ use sqlx::{Pool, Row, Sqlite};
 use std::convert::TryFrom;
 use tokio::fs;
 
-use crate::model::{FileDetails, FileMeta, FileRecord, ShardInfo};
+use crate::model::{
+    AccountRecord, FileDetails, FileMeta, FileRecord, RemoteShardRecord, ShardInfo,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -83,6 +85,38 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        sqlx::query(
+            r"
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                backend TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                token TEXT NOT NULL
+            );
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r"
+            CREATE TABLE IF NOT EXISTS remote_shards (
+                file_id TEXT NOT NULL,
+                ix INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                remote_ref TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                etag TEXT,
+                PRIMARY KEY(file_id, ix),
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -111,6 +145,160 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|row| row.get::<String, _>("value")))
+    }
+
+    /// Creates a new remote storage account record.
+    ///
+    /// # Errors
+    /// Returns an error if the record cannot be inserted.
+    pub async fn create_account(
+        &self,
+        name: &str,
+        backend: &str,
+        endpoint: &str,
+        token_ref: &str,
+    ) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO accounts(name, backend, endpoint, token) VALUES(?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(backend)
+        .bind(endpoint)
+        .bind(token_ref)
+        .execute(&mut *tx)
+        .await?;
+
+        let account_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(account_id)
+    }
+
+    /// Lists all configured remote accounts.
+    pub async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, backend, endpoint, token FROM accounts ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut accounts = Vec::with_capacity(rows.len());
+        for row in rows {
+            accounts.push(AccountRecord {
+                id: row.get("id"),
+                name: row.get("name"),
+                backend: row.get("backend"),
+                endpoint: row.get("endpoint"),
+                token_ref: row.get("token"),
+            });
+        }
+        Ok(accounts)
+    }
+
+    /// Fetches an account by name.
+    pub async fn get_account_by_name(&self, name: &str) -> Result<Option<AccountRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, backend, endpoint, token FROM accounts WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| AccountRecord {
+            id: row.get("id"),
+            name: row.get("name"),
+            backend: row.get("backend"),
+            endpoint: row.get("endpoint"),
+            token_ref: row.get("token"),
+        }))
+    }
+
+    /// Fetches an account by identifier.
+    pub async fn get_account_by_id(&self, account_id: i64) -> Result<Option<AccountRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, backend, endpoint, token FROM accounts WHERE id = ?",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| AccountRecord {
+            id: row.get("id"),
+            name: row.get("name"),
+            backend: row.get("backend"),
+            endpoint: row.get("endpoint"),
+            token_ref: row.get("token"),
+        }))
+    }
+
+    /// Associates a remote shard reference with a file shard.
+    ///
+    /// # Errors
+    /// Returns an error if the upsert fails.
+    pub async fn upsert_remote_shard(&self, record: &RemoteShardRecord) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO remote_shards(file_id, ix, account_id, remote_ref, size, etag) \
+             VALUES(?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(file_id, ix) DO UPDATE SET \
+                 account_id = excluded.account_id, \
+                 remote_ref = excluded.remote_ref, \
+                 size = excluded.size, \
+                 etag = excluded.etag",
+        )
+        .bind(&record.file_id)
+        .bind(i64::from(record.index))
+        .bind(record.account_id)
+        .bind(&record.remote_ref)
+        .bind(i64::try_from(record.size).context("remote shard size exceeds i64")?)
+        .bind(&record.etag)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Lists remote shard references for a file.
+    pub async fn list_remote_shards(&self, file_id: &str) -> Result<Vec<RemoteShardRecord>> {
+        let rows = sqlx::query(
+            "SELECT file_id, ix, account_id, remote_ref, size, etag FROM remote_shards WHERE file_id = ?",
+        )
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            let size: i64 = row.get("size");
+            entries.push(RemoteShardRecord {
+                file_id: row.get("file_id"),
+                index: u8::try_from(row.get::<i64, _>("ix")).context("remote ix exceeds u8")?,
+                account_id: row.get("account_id"),
+                remote_ref: row.get("remote_ref"),
+                size: u64::try_from(size).context("remote shard size negative")?,
+                etag: row.try_get("etag").ok(),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Removes all remote shard references for a file.
+    pub async fn remove_remote_shards(&self, file_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM remote_shards WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Removes a single remote shard entry.
+    pub async fn delete_remote_shard(&self, file_id: &str, index: u8) -> Result<()> {
+        sqlx::query("DELETE FROM remote_shards WHERE file_id = ? AND ix = ?")
+            .bind(file_id)
+            .bind(i64::from(index))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Inserts a file record and associated shard metadata transactionally.
@@ -155,6 +343,10 @@ impl Database {
     /// Returns an error if either deletion fails.
     pub async fn remove_file(&self, file_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM remote_shards WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM shards WHERE file_id = ?")
             .bind(file_id)
             .execute(&mut *tx)
@@ -257,6 +449,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
+    use crate::storage::httpbucket;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -292,5 +485,38 @@ mod tests {
 
         let details = db.get_file("file1").await.unwrap().unwrap();
         assert_eq!(details.shards.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn account_and_remote_tables() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let db = Database::connect(&db_path).await.unwrap();
+
+        let account_id = db
+            .create_account("primary", httpbucket::BACKEND_ID, "https://example", "vault:token")
+            .await
+            .unwrap();
+        let accounts = db.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id, account_id);
+
+        let record = RemoteShardRecord {
+            file_id: "file42".into(),
+            index: 1,
+            account_id,
+            remote_ref: "file42/shard_001.bin".into(),
+            size: 1024,
+            etag: Some("abc".into()),
+        };
+        db.upsert_remote_shard(&record).await.unwrap();
+
+        let remotes = db.list_remote_shards("file42").await.unwrap();
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].account_id, account_id);
+
+        db.delete_remote_shard("file42", 1).await.unwrap();
+        let remotes = db.list_remote_shards("file42").await.unwrap();
+        assert!(remotes.is_empty());
     }
 }

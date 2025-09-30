@@ -15,7 +15,12 @@ aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
+indicatif = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
 directories = { workspace = true }
 hex = { workspace = true }
 hkdf = { workspace = true }
@@ -29,8 +34,11 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
 zeroize = { workspace = true }
 zstd = { workspace = true }
 
@@ -38,3 +46,4 @@ zstd = { workspace = true }
 assert_fs = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+httptest = { workspace = true }

@@ -8,7 +8,7 @@ use tokio::fs;
 use zeroize::Zeroize;
 
 use crate::crypto::{self, WrappedKey, AEAD_NONCE_LEN, FILE_KEY_LEN, MASTER_KEY_LEN, SALT_LEN};
-use crate::model::{DefaultsConfig, VaultData, VaultFileEntry};
+use crate::model::{DefaultsConfig, VaultAccountEntry, VaultData, VaultFileEntry};
 use crate::util::write_atomic;
 
 #[derive(Debug)]
@@ -182,6 +182,24 @@ impl Vault {
         self.data.remove(file_id);
         self.save().await
     }
+
+    pub fn account(&self, account_id: i64) -> Option<&VaultAccountEntry> {
+        self.data.find_account(account_id)
+    }
+
+    pub fn accounts(&self) -> &[VaultAccountEntry] {
+        &self.data.accounts
+    }
+
+    pub async fn upsert_account(&mut self, entry: VaultAccountEntry) -> Result<()> {
+        self.data.upsert_account(entry);
+        self.save().await
+    }
+
+    pub async fn remove_account(&mut self, account_id: i64) -> Result<()> {
+        self.data.remove_account(account_id);
+        self.save().await
+    }
 }
 
 impl Drop for Vault {
@@ -221,5 +239,26 @@ mod tests {
         let _ = Vault::create(&path, "secret", defaults()).await.unwrap();
         let err = Vault::load(&path, "wrong").await.unwrap_err();
         assert!(format!("{err}").contains("decrypt"));
+    }
+
+    #[tokio::test]
+    async fn account_entries_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.bin");
+        let mut vault = Vault::create(&path, "secret", defaults()).await.unwrap();
+        let entry = VaultAccountEntry {
+            account_id: 1,
+            name: "primary".into(),
+            backend: "httpbucket".into(),
+            endpoint: "https://example".into(),
+            token: "secret-token".into(),
+            token_ref: "vault:token".into(),
+        };
+        vault.upsert_account(entry.clone()).await.unwrap();
+
+        let reloaded = Vault::load(&path, "secret").await.unwrap();
+        let stored = reloaded.account(1).unwrap();
+        assert_eq!(stored.name, entry.name);
+        assert_eq!(stored.token_ref, entry.token_ref);
     }
 }
