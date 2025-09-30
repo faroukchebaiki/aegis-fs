@@ -219,7 +219,7 @@ fn crash_resume_completes() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "Exercises ~1 GiB pack/unpack to stress IO; run manually"]
 fn heavy_round_trip() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
