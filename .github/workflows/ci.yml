@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop", "release/*", "feature/*", "*" ]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure cargo cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ubuntu-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ubuntu-${{ runner.os }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install just
+        run: cargo install just --locked
+
+      - name: Run CI suite
+        run: just ci
+
+  arch:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Update base packages
+        run: pacman -Sy --noconfirm base-devel pkgconf git curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install just
+        run: cargo install just --locked
+
+      - name: Run CI suite
+        run: just ci

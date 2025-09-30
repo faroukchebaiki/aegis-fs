@@ -1,0 +1,31 @@
+[package]
+name = "aegis-cli"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "aegis-fs"
+path = "src/main.rs"
+
+[dependencies]
+aegis-core = { path = "../core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+rpassword = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+assert_fs = { workspace = true }
+tempfile = { workspace = true }
+proptest = { workspace = true }
+assert_cmd = { workspace = true }
+chrono = { workspace = true }

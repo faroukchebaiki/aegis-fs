@@ -1,0 +1,3 @@
+# Clippy lint levels are driven by the Justfile commands:
+#   cargo clippy -- -W clippy::pedantic -A dead_code -D warnings
+# This keeps placeholder modules warning-free during Phase 0.

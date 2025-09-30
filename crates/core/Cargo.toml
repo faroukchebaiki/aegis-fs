@@ -1,0 +1,40 @@
+[package]
+name = "aegis-core"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+aead = { workspace = true }
+anyhow = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+hex = { workspace = true }
+hkdf = { workspace = true }
+password-hash = { workspace = true }
+rand = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+assert_fs = { workspace = true }
+proptest = { workspace = true }
+tempfile = { workspace = true }
