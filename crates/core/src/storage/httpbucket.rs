@@ -370,6 +370,10 @@ pub mod test_support {
             self.inner.lock().await.len()
         }
 
+        pub async fn is_empty(&self) -> bool {
+            self.len().await == 0
+        }
+
         pub async fn replace(&self, path: &str, data: Vec<u8>) {
             self.inner.lock().await.insert(path.to_string(), data);
         }
@@ -481,7 +485,15 @@ pub mod test_support {
                 let mut objects = state.inner.lock().await;
                 let entry = objects.entry(path.clone()).or_default();
                 if let Some(start) = parse_content_range(&headers) {
-                    let start = start as usize;
+                    let start = match usize::try_from(start) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return Response::builder()
+                                .status(416)
+                                .body(body::Bytes::new())
+                                .unwrap();
+                        }
+                    };
                     if entry.len() > start {
                         entry.truncate(start);
                     } else if entry.len() < start {
@@ -537,6 +549,10 @@ pub mod test_support {
         );
     }
 
+    /// Builds a normalized path for an object relative to the bucket endpoint.
+    ///
+    /// # Panics
+    /// Panics if `endpoint` is not a valid URL.
     #[must_use]
     pub fn object_path(endpoint: &str, locator: &str) -> String {
         let base = Url::parse(endpoint).expect("invalid endpoint");
