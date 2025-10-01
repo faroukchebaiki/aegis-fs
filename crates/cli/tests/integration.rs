@@ -125,7 +125,7 @@ fn remote_round_trip_via_cli() {
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .map_or(false, |name| name.starts_with("shard_"))
+            .is_some_and(|name| name.starts_with("shard_"))
         {
             fs::remove_file(path).unwrap();
         }
