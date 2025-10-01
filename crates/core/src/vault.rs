@@ -183,19 +183,25 @@ impl Vault {
         self.save().await
     }
 
+    #[must_use]
     pub fn account(&self, account_id: i64) -> Option<&VaultAccountEntry> {
         self.data.find_account(account_id)
     }
 
+    #[must_use]
     pub fn accounts(&self) -> &[VaultAccountEntry] {
         &self.data.accounts
     }
 
+    /// # Errors
+    /// Returns an error if the vault cannot be persisted after updating the account entry.
     pub async fn upsert_account(&mut self, entry: VaultAccountEntry) -> Result<()> {
         self.data.upsert_account(entry);
         self.save().await
     }
 
+    /// # Errors
+    /// Returns an error if the vault cannot be persisted after removing the account entry.
     pub async fn remove_account(&mut self, account_id: i64) -> Result<()> {
         self.data.remove_account(account_id);
         self.save().await

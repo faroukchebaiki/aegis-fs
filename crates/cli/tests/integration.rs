@@ -3,10 +3,13 @@ use std::io::Write;
 use std::path::Path;
 
 use aegis_core::model::{JournalEntry, JournalStage};
+use aegis_core::storage::httpbucket::test_support::{configure_bucket, BucketState};
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 use chrono::Utc;
+use httptest::Server;
 use tempfile::tempdir;
+use tokio::runtime::Runtime;
 
 const PASSWORD: &str = "test-pass";
 
@@ -62,6 +65,103 @@ fn round_trip_without_compression() {
     let original = fs::read(payload.path()).unwrap();
     let restored = fs::read(&out).unwrap();
     assert_eq!(original, restored);
+}
+
+#[test]
+fn remote_round_trip_via_cli() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    init_home(&home);
+
+    let server = Server::run();
+    let bucket_state = BucketState::new();
+    configure_bucket(&server, bucket_state.clone(), false);
+    let endpoint = server.url("/bucket/").to_string();
+
+    run_cmd(&home)
+        .arg("account")
+        .arg("add")
+        .arg("--password")
+        .arg(PASSWORD)
+        .arg("--name")
+        .arg("primary")
+        .arg("--backend")
+        .arg("httpbucket")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--token")
+        .arg("cli-token")
+        .assert()
+        .success();
+
+    let payload = assert_fs::NamedTempFile::new("remote.bin").unwrap();
+    payload.write_binary(b"cli remote payload").unwrap();
+
+    run_cmd(&home)
+        .arg("pack")
+        .arg("--password")
+        .arg(PASSWORD)
+        .arg("--id")
+        .arg("remote-cli")
+        .arg(payload.path())
+        .assert()
+        .success();
+
+    run_cmd(&home)
+        .arg("upload")
+        .arg("--password")
+        .arg(PASSWORD)
+        .arg("--id")
+        .arg("remote-cli")
+        .arg("--account")
+        .arg("primary")
+        .assert()
+        .success();
+
+    let shard_dir = home.join("objects").join("remote-cli");
+    for entry in fs::read_dir(&shard_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or(false, |name| name.starts_with("shard_"))
+        {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    let dest = dir.path().join("restored-remote.bin");
+    run_cmd(&home)
+        .arg("fetch")
+        .arg("--password")
+        .arg(PASSWORD)
+        .arg("--id")
+        .arg("remote-cli")
+        .arg("--account")
+        .arg("primary")
+        .arg("--overwrite")
+        .arg(&dest)
+        .assert()
+        .success();
+
+    let original = fs::read(payload.path()).unwrap();
+    let restored = fs::read(&dest).unwrap();
+    assert_eq!(original, restored);
+
+    run_cmd(&home)
+        .arg("gc-remote")
+        .arg("--password")
+        .arg(PASSWORD)
+        .arg("--id")
+        .arg("remote-cli")
+        .arg("--account")
+        .arg("primary")
+        .assert()
+        .success();
+
+    let len = Runtime::new().unwrap().block_on(bucket_state.len());
+    assert_eq!(len, 0);
 }
 
 #[test]

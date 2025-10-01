@@ -24,6 +24,7 @@ tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+aegis-core = { path = "../core", features = ["test-support"] }
 assert_fs = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }

@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use aegis_core::model::DefaultsConfig;
-use aegis_core::store::FileStore;
 use aegis_core::storage::httpbucket;
+use aegis_core::store::FileStore;
 use aegis_core::util::resolve_home;
 use aegis_core::{AegisFs, PackOptions, UnpackOptions};
 use anyhow::{Context, Result};

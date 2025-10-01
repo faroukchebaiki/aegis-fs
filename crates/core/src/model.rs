@@ -100,10 +100,10 @@ impl VaultData {
     }
 
     pub fn remove_account(&mut self, account_id: i64) {
-        self.accounts
-            .retain(|entry| entry.account_id != account_id);
+        self.accounts.retain(|entry| entry.account_id != account_id);
     }
 
+    #[must_use]
     pub fn find_account(&self, account_id: i64) -> Option<&VaultAccountEntry> {
         self.accounts
             .iter()

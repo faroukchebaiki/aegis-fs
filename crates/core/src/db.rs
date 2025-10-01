@@ -159,15 +159,13 @@ impl Database {
         token_ref: &str,
     ) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO accounts(name, backend, endpoint, token) VALUES(?, ?, ?, ?)",
-        )
-        .bind(name)
-        .bind(backend)
-        .bind(endpoint)
-        .bind(token_ref)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO accounts(name, backend, endpoint, token) VALUES(?, ?, ?, ?)")
+            .bind(name)
+            .bind(backend)
+            .bind(endpoint)
+            .bind(token_ref)
+            .execute(&mut *tx)
+            .await?;
 
         let account_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
             .fetch_one(&mut *tx)
@@ -177,6 +175,9 @@ impl Database {
     }
 
     /// Lists all configured remote accounts.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying query fails.
     pub async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
         let rows = sqlx::query(
             "SELECT id, name, backend, endpoint, token FROM accounts ORDER BY name ASC",
@@ -198,13 +199,15 @@ impl Database {
     }
 
     /// Fetches an account by name.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup query fails.
     pub async fn get_account_by_name(&self, name: &str) -> Result<Option<AccountRecord>> {
-        let row = sqlx::query(
-            "SELECT id, name, backend, endpoint, token FROM accounts WHERE name = ?",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, name, backend, endpoint, token FROM accounts WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
@@ -216,13 +219,15 @@ impl Database {
     }
 
     /// Fetches an account by identifier.
+    ///
+    /// # Errors
+    /// Returns an error if the lookup query fails.
     pub async fn get_account_by_id(&self, account_id: i64) -> Result<Option<AccountRecord>> {
-        let row = sqlx::query(
-            "SELECT id, name, backend, endpoint, token FROM accounts WHERE id = ?",
-        )
-        .bind(account_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, name, backend, endpoint, token FROM accounts WHERE id = ?")
+                .bind(account_id)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
@@ -259,6 +264,9 @@ impl Database {
     }
 
     /// Lists remote shard references for a file.
+    ///
+    /// # Errors
+    /// Returns an error if the query fails or the stored metadata cannot be parsed.
     pub async fn list_remote_shards(&self, file_id: &str) -> Result<Vec<RemoteShardRecord>> {
         let rows = sqlx::query(
             "SELECT file_id, ix, account_id, remote_ref, size, etag FROM remote_shards WHERE file_id = ?",
@@ -283,6 +291,9 @@ impl Database {
     }
 
     /// Removes all remote shard references for a file.
+    ///
+    /// # Errors
+    /// Returns an error if the delete statement fails.
     pub async fn remove_remote_shards(&self, file_id: &str) -> Result<()> {
         sqlx::query("DELETE FROM remote_shards WHERE file_id = ?")
             .bind(file_id)
@@ -292,6 +303,9 @@ impl Database {
     }
 
     /// Removes a single remote shard entry.
+    ///
+    /// # Errors
+    /// Returns an error if the delete statement fails.
     pub async fn delete_remote_shard(&self, file_id: &str, index: u8) -> Result<()> {
         sqlx::query("DELETE FROM remote_shards WHERE file_id = ? AND ix = ?")
             .bind(file_id)
@@ -447,9 +461,9 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::httpbucket;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine;
-    use crate::storage::httpbucket;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -494,12 +508,36 @@ mod tests {
         let db = Database::connect(&db_path).await.unwrap();
 
         let account_id = db
-            .create_account("primary", httpbucket::BACKEND_ID, "https://example", "vault:token")
+            .create_account(
+                "primary",
+                httpbucket::BACKEND_ID,
+                "https://example",
+                "vault:token",
+            )
             .await
             .unwrap();
         let accounts = db.list_accounts().await.unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, account_id);
+
+        let file_meta = FileMeta {
+            file_id: "file42".into(),
+            name: None,
+            plaintext_size: 0,
+            compressed_size: 0,
+            ciphertext_size: 0,
+            shard_size: 0,
+            k: 1,
+            m: 1,
+            compressed: false,
+            nonce: BASE64.encode([0_u8; 12]),
+            checksums: vec![ShardInfo {
+                index: 1,
+                size: 0,
+                checksum: "00".into(),
+            }],
+        };
+        db.insert_file(&file_meta, Utc::now()).await.unwrap();
 
         let record = RemoteShardRecord {
             file_id: "file42".into(),
