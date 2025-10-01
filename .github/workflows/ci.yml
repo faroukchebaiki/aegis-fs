@@ -31,7 +31,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install just
-        run: cargo install just --locked
+        run: |
+          if command -v just >/dev/null 2>&1; then
+            echo "just already installed"
+          else
+            cargo install just --locked
+          fi
 
       - name: Run CI suite
         run: just ci
@@ -52,7 +57,12 @@ jobs:
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Install just
-        run: cargo install just --locked
+        run: |
+          if command -v just >/dev/null 2>&1; then
+            echo "just already installed"
+          else
+            cargo install just --locked
+          fi
 
       - name: Run CI suite
         run: just ci
