@@ -485,14 +485,11 @@ pub mod test_support {
                 let mut objects = state.inner.lock().await;
                 let entry = objects.entry(path.clone()).or_default();
                 if let Some(start) = parse_content_range(&headers) {
-                    let start = match usize::try_from(start) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            return Response::builder()
-                                .status(416)
-                                .body(body::Bytes::new())
-                                .unwrap();
-                        }
+                    let Ok(start) = usize::try_from(start) else {
+                        return Response::builder()
+                            .status(416)
+                            .body(body::Bytes::new())
+                            .unwrap();
                     };
                     if entry.len() > start {
                         entry.truncate(start);
