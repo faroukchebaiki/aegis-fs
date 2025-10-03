@@ -115,7 +115,8 @@ struct RemoveArgs {
 #[derive(Subcommand, Debug)]
 enum AccountCommand {
     Add(AccountAddArgs),
-    List,
+    List(AccountListArgs),
+    SetWeight(AccountSetWeightArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -133,13 +134,31 @@ struct AccountAddArgs {
 }
 
 #[derive(Parser, Debug)]
+struct AccountListArgs {
+    #[arg(long)]
+    verbose: bool,
+}
+
+#[derive(Parser, Debug)]
+struct AccountSetWeightArgs {
+    #[arg(long)]
+    password: Option<String>,
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    weight: i64,
+}
+
+#[derive(Parser, Debug)]
 struct UploadArgs {
     #[arg(long)]
     password: Option<String>,
     #[arg(long = "id")]
     file_id: String,
-    #[arg(long)]
-    account: Option<String>,
+    #[arg(long = "plan-only")]
+    plan_only: bool,
+    #[arg(long, hide = true)]
+    seed: Option<u64>,
 }
 
 #[derive(Parser, Debug)]
@@ -321,7 +340,7 @@ async fn handle_account(
             password.zeroize();
             println!("Account '{}' registered (id {})", args.name, account_id);
         }
-        AccountCommand::List => {
+        AccountCommand::List(args) => {
             let password = resolve_password("Master password", None)?;
             let fs = AegisFs::load(home_paths).await?;
             let accounts = fs.list_accounts(password.as_ref()).await?;
@@ -329,15 +348,41 @@ async fn handle_account(
                 println!("No remote accounts configured");
             } else {
                 for entry in accounts {
-                    println!(
-                        "{}\tbackend={}\tendpoint={}\ttoken={}",
-                        entry.record.name,
-                        entry.record.backend,
-                        entry.record.endpoint,
-                        if entry.has_token { "stored" } else { "missing" }
-                    );
+                    if args.verbose {
+                        println!(
+                            "{name}\tbackend={backend}\tendpoint={endpoint}\tweight={weight}\tsuccess_rate={rate:.2}\tlast_error={error}\ttoken={token}",
+                            name = entry.record.name,
+                            backend = entry.record.backend,
+                            endpoint = entry.record.endpoint,
+                            weight = entry.record.weight,
+                            rate = entry.record.success_rate,
+                            error = entry
+                                .record
+                                .last_error
+                                .as_deref()
+                                .unwrap_or("-"),
+                            token = if entry.has_token { "stored" } else { "missing" }
+                        );
+                    } else {
+                        println!(
+                            "{}\tbackend={}\tendpoint={}\ttoken={}",
+                            entry.record.name,
+                            entry.record.backend,
+                            entry.record.endpoint,
+                            if entry.has_token { "stored" } else { "missing" }
+                        );
+                    }
                 }
             }
+        }
+        AccountCommand::SetWeight(args) => {
+            anyhow::ensure!(args.weight > 0, "weight must be > 0");
+            let mut password = resolve_password("Master password", args.password)?;
+            let fs = AegisFs::load(home_paths).await?;
+            fs.set_account_weight(password.as_ref(), &args.name, args.weight)
+                .await?;
+            password.zeroize();
+            println!("Updated weight for '{}' to {}", args.name, args.weight);
         }
     }
     Ok(())
@@ -346,9 +391,30 @@ async fn handle_account(
 async fn handle_upload(home_paths: aegis_core::util::HomePaths, args: UploadArgs) -> Result<()> {
     let password = resolve_password("Master password", args.password)?;
     let fs = AegisFs::load(home_paths).await?;
-    fs.upload_shards(password.as_ref(), &args.file_id, args.account.as_deref())
-        .await?;
-    println!("Uploaded shards for {}", args.file_id);
+    if args.plan_only {
+        let plan = fs
+            .plan_upload(password.as_ref(), &args.file_id, args.seed)
+            .await?;
+        if plan.is_empty() {
+            println!("No shards to plan for {}", args.file_id);
+        } else {
+            println!("Placement plan for {}:", args.file_id);
+            for entry in plan {
+                println!(
+                    "shard {:03} -> account {} (id {}) locator={} size={} bytes",
+                    entry.shard_index,
+                    entry.account_name,
+                    entry.account_id,
+                    entry.remote_ref,
+                    entry.size
+                );
+            }
+        }
+    } else {
+        fs.upload_shards(password.as_ref(), &args.file_id)
+            .await?;
+        println!("Uploaded shards for {}", args.file_id);
+    }
     Ok(())
 }
 

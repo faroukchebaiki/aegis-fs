@@ -8,7 +8,8 @@ use std::convert::TryFrom;
 use tokio::fs;
 
 use crate::model::{
-    AccountRecord, FileDetails, FileMeta, FileRecord, RemoteShardRecord, ShardInfo,
+    AccountRecord, FileDetails, FileMeta, FileRecord, RemoteShardRecord, RemoteShardStatus,
+    ShardInfo,
 };
 
 #[derive(Clone)]
@@ -41,6 +42,20 @@ impl Database {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    async fn ensure_column(&self, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let query = format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}' LIMIT 1"
+        );
+        let missing = sqlx::query_scalar::<_, i64>(&query)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_none();
+        if missing {
+            sqlx::query(ddl).execute(&self.pool).await?;
+        }
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -93,7 +108,10 @@ impl Database {
                 name TEXT NOT NULL UNIQUE,
                 backend TEXT NOT NULL,
                 endpoint TEXT NOT NULL,
-                token TEXT NOT NULL
+                token TEXT NOT NULL,
+                weight INTEGER NOT NULL DEFAULT 1,
+                success_rate REAL NOT NULL DEFAULT 1.0,
+                last_error TEXT
             );
             ",
         )
@@ -109,11 +127,57 @@ impl Database {
                 remote_ref TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 etag TEXT,
+                status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','UPLOADING','OK','MISSING','STALE')),
                 PRIMARY KEY(file_id, ix),
                 FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
             ",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        self
+            .ensure_column(
+                "accounts",
+                "weight",
+                "ALTER TABLE accounts ADD COLUMN weight INTEGER NOT NULL DEFAULT 1",
+            )
+            .await?;
+        self
+            .ensure_column(
+                "accounts",
+                "success_rate",
+                "ALTER TABLE accounts ADD COLUMN success_rate REAL NOT NULL DEFAULT 1.0",
+            )
+            .await?;
+        self
+            .ensure_column(
+                "accounts",
+                "last_error",
+                "ALTER TABLE accounts ADD COLUMN last_error TEXT",
+            )
+            .await?;
+        self
+            .ensure_column(
+                "remote_shards",
+                "status",
+                "ALTER TABLE remote_shards ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','UPLOADING','OK','MISSING','STALE'))",
+            )
+            .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_weight ON accounts(weight)"
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_success_rate ON accounts(success_rate)"
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_remote_shards_status ON remote_shards(status)"
         )
         .execute(&self.pool)
         .await?;
@@ -159,11 +223,17 @@ impl Database {
         token_ref: &str,
     ) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO accounts(name, backend, endpoint, token) VALUES(?, ?, ?, ?)")
+        sqlx::query(
+            "INSERT INTO accounts(name, backend, endpoint, token, weight, success_rate, last_error) \
+             VALUES(?, ?, ?, ?, ?, ?, ?)",
+        )
             .bind(name)
             .bind(backend)
             .bind(endpoint)
             .bind(token_ref)
+            .bind(1_i64)
+            .bind(1_f64)
+            .bind::<Option<&str>>(None)
             .execute(&mut *tx)
             .await?;
 
@@ -180,7 +250,7 @@ impl Database {
     /// Returns an error if the underlying query fails.
     pub async fn list_accounts(&self) -> Result<Vec<AccountRecord>> {
         let rows = sqlx::query(
-            "SELECT id, name, backend, endpoint, token FROM accounts ORDER BY name ASC",
+            "SELECT id, name, backend, endpoint, token, weight, success_rate, last_error FROM accounts ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -193,6 +263,9 @@ impl Database {
                 backend: row.get("backend"),
                 endpoint: row.get("endpoint"),
                 token_ref: row.get("token"),
+                weight: row.get("weight"),
+                success_rate: row.get("success_rate"),
+                last_error: row.try_get("last_error").ok(),
             });
         }
         Ok(accounts)
@@ -203,11 +276,12 @@ impl Database {
     /// # Errors
     /// Returns an error if the lookup query fails.
     pub async fn get_account_by_name(&self, name: &str) -> Result<Option<AccountRecord>> {
-        let row =
-            sqlx::query("SELECT id, name, backend, endpoint, token FROM accounts WHERE name = ?")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query(
+            "SELECT id, name, backend, endpoint, token, weight, success_rate, last_error FROM accounts WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
@@ -215,6 +289,9 @@ impl Database {
             backend: row.get("backend"),
             endpoint: row.get("endpoint"),
             token_ref: row.get("token"),
+            weight: row.get("weight"),
+            success_rate: row.get("success_rate"),
+            last_error: row.try_get("last_error").ok(),
         }))
     }
 
@@ -223,11 +300,12 @@ impl Database {
     /// # Errors
     /// Returns an error if the lookup query fails.
     pub async fn get_account_by_id(&self, account_id: i64) -> Result<Option<AccountRecord>> {
-        let row =
-            sqlx::query("SELECT id, name, backend, endpoint, token FROM accounts WHERE id = ?")
-                .bind(account_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row = sqlx::query(
+            "SELECT id, name, backend, endpoint, token, weight, success_rate, last_error FROM accounts WHERE id = ?",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row.map(|row| AccountRecord {
             id: row.get("id"),
@@ -235,7 +313,36 @@ impl Database {
             backend: row.get("backend"),
             endpoint: row.get("endpoint"),
             token_ref: row.get("token"),
+            weight: row.get("weight"),
+            success_rate: row.get("success_rate"),
+            last_error: row.try_get("last_error").ok(),
         }))
+    }
+
+    /// Updates the weighting factor for an account.
+    pub async fn update_account_weight(&self, account_id: i64, weight: i64) -> Result<()> {
+        sqlx::query("UPDATE accounts SET weight = ? WHERE id = ?")
+            .bind(weight)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Updates success metrics for an account.
+    pub async fn update_account_health(
+        &self,
+        account_id: i64,
+        success_rate: f64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE accounts SET success_rate = ?, last_error = ? WHERE id = ?")
+            .bind(success_rate)
+            .bind(last_error)
+            .bind(account_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Associates a remote shard reference with a file shard.
@@ -244,13 +351,14 @@ impl Database {
     /// Returns an error if the upsert fails.
     pub async fn upsert_remote_shard(&self, record: &RemoteShardRecord) -> Result<()> {
         sqlx::query(
-            "INSERT INTO remote_shards(file_id, ix, account_id, remote_ref, size, etag) \
-             VALUES(?, ?, ?, ?, ?, ?) \
+            "INSERT INTO remote_shards(file_id, ix, account_id, remote_ref, size, etag, status) \
+             VALUES(?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(file_id, ix) DO UPDATE SET \
                  account_id = excluded.account_id, \
                  remote_ref = excluded.remote_ref, \
                  size = excluded.size, \
-                 etag = excluded.etag",
+                 etag = excluded.etag, \
+                 status = excluded.status",
         )
         .bind(&record.file_id)
         .bind(i64::from(record.index))
@@ -258,8 +366,25 @@ impl Database {
         .bind(&record.remote_ref)
         .bind(i64::try_from(record.size).context("remote shard size exceeds i64")?)
         .bind(&record.etag)
+        .bind(record.status.as_str())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Sets the status for a remote shard entry.
+    pub async fn set_remote_shard_status(
+        &self,
+        file_id: &str,
+        index: u8,
+        status: RemoteShardStatus,
+    ) -> Result<()> {
+        sqlx::query("UPDATE remote_shards SET status = ? WHERE file_id = ? AND ix = ?")
+            .bind(status.as_str())
+            .bind(file_id)
+            .bind(i64::from(index))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -269,7 +394,7 @@ impl Database {
     /// Returns an error if the query fails or the stored metadata cannot be parsed.
     pub async fn list_remote_shards(&self, file_id: &str) -> Result<Vec<RemoteShardRecord>> {
         let rows = sqlx::query(
-            "SELECT file_id, ix, account_id, remote_ref, size, etag FROM remote_shards WHERE file_id = ?",
+            "SELECT file_id, ix, account_id, remote_ref, size, etag, status FROM remote_shards WHERE file_id = ?",
         )
         .bind(file_id)
         .fetch_all(&self.pool)
@@ -278,6 +403,7 @@ impl Database {
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
             let size: i64 = row.get("size");
+            let status_str: String = row.get("status");
             entries.push(RemoteShardRecord {
                 file_id: row.get("file_id"),
                 index: u8::try_from(row.get::<i64, _>("ix")).context("remote ix exceeds u8")?,
@@ -285,6 +411,7 @@ impl Database {
                 remote_ref: row.get("remote_ref"),
                 size: u64::try_from(size).context("remote shard size negative")?,
                 etag: row.try_get("etag").ok(),
+                status: RemoteShardStatus::try_from(status_str.as_str())?,
             });
         }
         Ok(entries)
@@ -312,6 +439,17 @@ impl Database {
             .bind(i64::from(index))
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Clears pending or in-progress plan entries for a file.
+    pub async fn clear_pending_plan(&self, file_id: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM remote_shards WHERE file_id = ? AND status IN ('PENDING','UPLOADING')",
+        )
+        .bind(file_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -519,6 +657,9 @@ mod tests {
         let accounts = db.list_accounts().await.unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, account_id);
+        assert_eq!(accounts[0].weight, 1);
+        assert!((accounts[0].success_rate - 1.0).abs() < f64::EPSILON);
+        assert!(accounts[0].last_error.is_none());
 
         let file_meta = FileMeta {
             file_id: "file42".into(),
@@ -546,12 +687,20 @@ mod tests {
             remote_ref: "file42/shard_001.bin".into(),
             size: 1024,
             etag: Some("abc".into()),
+             status: RemoteShardStatus::Pending,
         };
         db.upsert_remote_shard(&record).await.unwrap();
 
         let remotes = db.list_remote_shards("file42").await.unwrap();
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].account_id, account_id);
+        assert_eq!(remotes[0].status, RemoteShardStatus::Pending);
+
+        db.set_remote_shard_status("file42", 1, RemoteShardStatus::Ok)
+            .await
+            .unwrap();
+        let remotes = db.list_remote_shards("file42").await.unwrap();
+        assert_eq!(remotes[0].status, RemoteShardStatus::Ok);
 
         db.delete_remote_shard("file42", 1).await.unwrap();
         let remotes = db.list_remote_shards("file42").await.unwrap();

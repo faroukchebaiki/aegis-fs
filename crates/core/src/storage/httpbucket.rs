@@ -10,6 +10,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio_util::io::ReaderStream;
 use url::Url;
+use thiserror::Error;
 
 use crate::model::{Credential, ObjectMeta, RemoteRef, Session};
 use crate::storage::Storage;
@@ -19,6 +20,30 @@ const CHECKSUM_HEADER: &str = "x-aegis-checksum";
 
 pub struct HttpBucketStorage {
     client: Client,
+}
+
+#[derive(Debug, Error)]
+#[error("{operation} failed with status {status}")]
+pub struct HttpStatusError {
+    operation: &'static str,
+    status: StatusCode,
+}
+
+impl HttpStatusError {
+    #[must_use]
+    pub fn new(operation: &'static str, status: StatusCode) -> Self {
+        Self { operation, status }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        self.status.is_server_error() || self.status == StatusCode::TOO_MANY_REQUESTS
+    }
 }
 
 impl HttpBucketStorage {
@@ -103,7 +128,7 @@ impl HttpBucketStorage {
                 Ok(Some(ObjectMeta { size: len, etag }))
             }
             StatusCode::NOT_FOUND => Ok(None),
-            status => Err(anyhow!("unexpected status {status} during HEAD")),
+            status => Err(HttpStatusError::new("stat", status).into()),
         }
     }
 
@@ -241,7 +266,8 @@ impl Storage for HttpBucketStorage {
 
             let response = request.send().await.context("performing PUT")?;
 
-            if response.status().is_success() {
+            let status = response.status();
+            if status.is_success() {
                 if let Some(val) = response
                     .headers()
                     .get(ETAG)
@@ -253,12 +279,12 @@ impl Storage for HttpBucketStorage {
             }
 
             if resume_from == 0 {
-                return Err(anyhow!("upload failed with status {}", response.status()));
+                return Err(HttpStatusError::new("upload", status).into());
             }
 
             attempt += 1;
             if attempt > 1 {
-                return Err(anyhow!("failed to upload {locator} after retry"));
+                return Err(HttpStatusError::new("upload", status).into());
             }
         }
 
@@ -283,7 +309,7 @@ impl Storage for HttpBucketStorage {
             .context("issuing GET request")?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("download failed with status {}", response.status()));
+            return Err(HttpStatusError::new("download", response.status()).into());
         }
 
         if let Some(parent) = dst.parent() {
@@ -327,7 +353,7 @@ impl Storage for HttpBucketStorage {
         if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
             Ok(())
         } else {
-            Err(anyhow!("delete failed with status {}", response.status()))
+            Err(HttpStatusError::new("delete", response.status()).into())
         }
     }
 

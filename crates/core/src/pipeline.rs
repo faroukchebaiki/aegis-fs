@@ -1,13 +1,25 @@
+use std::borrow::ToOwned;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use backoff::future::retry;
+use backoff::{Error as BackoffError, ExponentialBackoff};
+use governor::clock::DefaultClock;
+use governor::state::{InMemoryState, NotKeyed};
+use governor::{Quota, RateLimiter};
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::Error as ReqwestError;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -17,9 +29,10 @@ use crate::erasure::Erasure;
 use crate::journal::Journal;
 use crate::model::{
     AccountRecord, Credential, DefaultsConfig, FileDetails, FileMeta, FileRecord, JournalStage,
-    RemoteRef, RemoteShardRecord, VaultAccountEntry, VaultFileEntry,
+    PlacementPlanShard, RemoteRef, RemoteShardRecord, RemoteShardStatus, Session, ShardInfo,
+    VaultAccountEntry, VaultFileEntry,
 };
-use crate::storage::httpbucket::{self, HttpBucketStorage};
+use crate::storage::httpbucket::{self, HttpBucketStorage, HttpStatusError};
 use crate::storage::Storage;
 use crate::store::FileStore;
 use crate::util::{utc_now, HomePaths};
@@ -49,6 +62,26 @@ pub struct AccountListing {
     pub record: AccountRecord,
     pub has_token: bool,
 }
+
+type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+
+#[derive(Clone)]
+struct AccountRuntime {
+    record: AccountRecord,
+    session: Session,
+    storage: Arc<dyn Storage>,
+    limiter: Arc<Limiter>,
+    stats: Arc<Mutex<AccountStats>>,
+}
+
+#[derive(Clone, Debug)]
+struct AccountStats {
+    success_rate: f64,
+    last_error: Option<String>,
+}
+
+const GLOBAL_CONCURRENCY_LIMIT: usize = 8;
+const BASE_RATE_PER_SECOND: u32 = 4;
 
 struct ResolvedAccount {
     record: AccountRecord,
@@ -117,6 +150,41 @@ impl AegisFs {
         Ok(())
     }
 
+    async fn build_account_runtime(
+        &self,
+        record: AccountRecord,
+        vault_entry: VaultAccountEntry,
+    ) -> Result<Arc<AccountRuntime>> {
+        let credential = Credential {
+            account_id: record.id,
+            backend: record.backend.clone(),
+            endpoint: record.endpoint.clone(),
+            token: vault_entry.token.clone(),
+            token_ref: vault_entry.token_ref.clone(),
+        };
+
+        let storage = Self::instantiate_storage(&record.backend)?;
+        let session = storage.login(&credential).await?;
+        let weight = u32::try_from(record.weight.max(1))
+            .context("account weight exceeds platform range")?;
+        let rate_per_second = (BASE_RATE_PER_SECOND.saturating_mul(weight)).max(1);
+        let quota = Quota::per_second(
+            std::num::NonZeroU32::new(rate_per_second).expect("non-zero quota"),
+        );
+        let limiter = Arc::new(RateLimiter::direct(quota));
+
+        Ok(Arc::new(AccountRuntime {
+            record,
+            session,
+            storage,
+            limiter,
+            stats: Arc::new(Mutex::new(AccountStats {
+                success_rate: record.success_rate,
+                last_error: record.last_error.clone(),
+            })),
+        }))
+    }
+
     /// Adds a remote storage account backed by the encrypted vault.
     ///
     /// # Errors
@@ -166,6 +234,31 @@ impl AegisFs {
             })
             .collect();
         Ok(listings)
+    }
+
+    /// Updates the weight for a stored account, ensuring credentials exist.
+    pub async fn set_account_weight(
+        &self,
+        password: &str,
+        name: &str,
+        weight: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(weight > 0, "weight must be > 0");
+        let vault = self.unlock_vault(password).await?;
+        let account = self
+            .db
+            .get_account_by_name(name)
+            .await?
+            .context("account not found")?;
+        anyhow::ensure!(
+            vault.account(account.id).is_some(),
+            "credential missing from vault for account '{}'",
+            account.name
+        );
+        self.db
+            .update_account_weight(account.id, weight)
+            .await?;
+        Ok(())
     }
 
     /// Retrieves all tracked file records ordered by creation time.
@@ -286,66 +379,230 @@ impl AegisFs {
     ///
     /// # Errors
     /// Returns an error if unlocking the vault fails, local shards are missing, or remote persistence fails.
-    pub async fn upload_shards(
+    pub async fn plan_upload(
         &self,
         password: &str,
         file_id: &str,
-        account_name: Option<&str>,
-    ) -> Result<()> {
+        seed: Option<u64>,
+    ) -> Result<Vec<PlacementPlanShard>> {
         let vault = self.unlock_vault(password).await?;
-        let resolved = self
-            .resolve_account(&vault, account_name)
-            .await
-            .context("resolving account")?;
-
-        let storage = Self::instantiate_storage(&resolved.record.backend)?;
-        let session = storage.login(&resolved.credential).await?;
-
         let store = FileStore::new(self.paths.objects_dir.clone());
         store.ensure_dir(file_id).await?;
         let meta = store.read_meta(file_id).await?;
-        for shard in &meta.checksums {
-            let shard_path = store.shard_path(file_id, shard.index as usize);
-            if !shard_path.exists() {
-                anyhow::bail!(
-                    "local shard {} missing; run pack before upload",
-                    shard.index
-                );
+        let total_shards = usize::from(meta.k + meta.m);
+        anyhow::ensure!(total_shards > 0, "file {file_id} has no shards to upload");
+
+        let mut accounts = self.db.list_accounts().await?;
+        accounts.retain(|record| {
+            record.backend == httpbucket::BACKEND_ID
+                && record.weight > 0
+                && vault.account(record.id).is_some()
+        });
+
+        let available = accounts.len();
+        anyhow::ensure!(
+            available >= total_shards,
+            "need ≥ {} accounts, have {}",
+            total_shards,
+            available
+        );
+
+        #[derive(Clone)]
+        struct PlacementState {
+            record: AccountRecord,
+            current: i64,
+        }
+
+        let mut states: Vec<PlacementState> = accounts
+            .into_iter()
+            .map(|record| PlacementState {
+                record,
+                current: 0,
+            })
+            .collect();
+
+        if let Some(seed_value) = seed {
+            if !states.is_empty() {
+                let shift = (seed_value as usize) % states.len();
+                states.rotate_left(shift);
             }
-            let hint = format!("{}/shard_{:03}.bin", file_id, shard.index);
-            info!(
-                file_id = %file_id,
-                index = shard.index,
-                "uploading shard to account {}",
-                resolved.record.name
-            );
-            let remote_ref = storage
-                .upload(&session, &shard_path, Some(&hint))
-                .await
-                .with_context(|| format!("uploading shard {}", shard.index))?;
-            let object_meta = storage
-                .stat(&session, &remote_ref)
-                .await
-                .with_context(|| format!("stat remote shard {}", shard.index))?;
+        }
 
-            info!(
-                file_id = %file_id,
-                index = shard.index,
-                remote_size = object_meta.size,
-                "remote shard uploaded (checksum {}...)",
-                &shard.checksum[..shard.checksum.len().min(12)]
-            );
+        let total_weight: i64 = states.iter().map(|state| state.record.weight).sum();
+        anyhow::ensure!(total_weight > 0, "all account weights must be positive");
 
+        let mut selected = Vec::with_capacity(total_shards);
+        let mut iterations = 0_usize;
+        while selected.len() < total_shards {
+            iterations += 1;
+            for state in &mut states {
+                state.current += state.record.weight;
+            }
+            let (idx, _) = states
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, state)| state.current)
+                .expect("non-empty state set");
+            let state = &mut states[idx];
+            if !selected.iter().any(|record: &AccountRecord| record.id == state.record.id) {
+                selected.push(state.record.clone());
+            }
+            state.current -= total_weight;
+            anyhow::ensure!(
+                iterations <= total_shards * states.len() * 4,
+                "weighted placement failed to converge"
+            );
+        }
+
+        let mut shard_infos = meta.checksums.clone();
+        shard_infos.sort_by_key(|info| info.index);
+
+        self.db.clear_pending_plan(file_id).await?;
+
+        let mut plan = Vec::with_capacity(total_shards);
+        for (shard, account) in shard_infos.iter().zip(selected.iter()) {
+            let size = u64::try_from(shard.size).context("shard size exceeds u64")?;
+            let remote_ref = format!("{}/shard_{:03}.bin", file_id, shard.index);
             let record = RemoteShardRecord {
                 file_id: file_id.to_string(),
                 index: shard.index,
-                account_id: resolved.record.id,
-                remote_ref: remote_ref.locator.clone(),
-                size: object_meta.size,
-                etag: object_meta.etag.clone(),
+                account_id: account.id,
+                remote_ref: remote_ref.clone(),
+                size,
+                etag: None,
+                status: RemoteShardStatus::Pending,
             };
             self.db.upsert_remote_shard(&record).await?;
+            plan.push(PlacementPlanShard {
+                shard_index: shard.index,
+                account_id: account.id,
+                account_name: account.name.clone(),
+                remote_ref,
+                size,
+            });
         }
+
+        Ok(plan)
+    }
+
+    /// Uploads shards for a file to a remote backend.
+    ///
+    /// # Errors
+    /// Returns an error if unlocking the vault fails, local shards are missing, or remote persistence fails.
+    pub async fn upload_shards(&self, password: &str, file_id: &str) -> Result<()> {
+        let vault = self.unlock_vault(password).await?;
+        let store = Arc::new(FileStore::new(self.paths.objects_dir.clone()));
+        store.ensure_dir(file_id).await?;
+        let meta = store.read_meta(file_id).await?;
+
+        let mut pending_plan = Vec::new();
+        let mut account_cache: HashMap<i64, AccountRecord> = HashMap::new();
+        for record in self.db.list_remote_shards(file_id).await? {
+            if record.status != RemoteShardStatus::Pending {
+                continue;
+            }
+            let account = if let Some(existing) = account_cache.get(&record.account_id) {
+                existing.clone()
+            } else {
+                let fetched = self
+                    .db
+                    .get_account_by_id(record.account_id)
+                    .await?
+                    .context("account missing during plan load")?;
+                account_cache.insert(record.account_id, fetched.clone());
+                fetched
+            };
+            pending_plan.push(PlacementPlanShard {
+                shard_index: record.index,
+                account_id: record.account_id,
+                account_name: account.name.clone(),
+                remote_ref: record.remote_ref.clone(),
+                size: record.size,
+            });
+        }
+
+        if pending_plan.is_empty() {
+            pending_plan = self.plan_upload(password, file_id, None).await?;
+        }
+
+        anyhow::ensure!(!pending_plan.is_empty(), "no shards to upload for {file_id}");
+
+        let mut runtimes = HashMap::new();
+        for plan in &pending_plan {
+            if runtimes.contains_key(&plan.account_id) {
+                continue;
+            }
+            let account_record = self
+                .db
+                .get_account_by_id(plan.account_id)
+                .await?
+                .context("account missing during upload")?;
+            let vault_entry = vault
+                .account(plan.account_id)
+                .cloned()
+                .context("vault credential missing")?;
+            let runtime = self
+                .build_account_runtime(account_record, vault_entry)
+                .await?;
+            runtimes.insert(plan.account_id, runtime);
+        }
+
+        let semaphore = Arc::new(Semaphore::new(GLOBAL_CONCURRENCY_LIMIT));
+        let overall = ProgressBar::new(pending_plan.len() as u64);
+        overall.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} uploading {pos}/{len} shards ({percent}%)",
+            )
+            .unwrap()
+            .progress_chars("=>"),
+        );
+
+        let mut handles = Vec::new();
+        for plan in pending_plan {
+            let shard_meta = meta
+                .checksums
+                .iter()
+                .find(|info| info.index == plan.shard_index)
+                .cloned()
+                .context("missing shard metadata")?;
+            let runtime = runtimes
+                .get(&plan.account_id)
+                .cloned()
+                .context("account runtime missing")?;
+            let semaphore = semaphore.clone();
+            let db = self.db.clone();
+            let store = store.clone();
+            let overall = overall.clone();
+            let file_id = file_id.to_string();
+            handles.push(tokio::spawn(async move {
+                process_shard(
+                    db,
+                    store,
+                    semaphore,
+                    overall,
+                    runtime,
+                    file_id,
+                    plan,
+                    shard_meta,
+                )
+                .await
+            }));
+        }
+
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => errors.push(err),
+                Err(err) => errors.push(anyhow!("upload task panicked: {err}")),
+            }
+        }
+        overall.finish_with_message("upload complete");
+
+        if let Some(err) = errors.into_iter().next() {
+            return Err(err);
+        }
+
         Ok(())
     }
 
@@ -500,7 +757,7 @@ impl AegisFs {
                 token_ref: vault_entry.token_ref.clone(),
             };
 
-            let storage = Self::instantiate_storage(&account_record.backend)?;
+        let storage = Self::instantiate_storage(&account_record.backend)?;
             let session = storage.login(&credential).await?;
 
             for entry in entries {
@@ -533,9 +790,9 @@ impl AegisFs {
         }
     }
 
-    fn instantiate_storage(backend: &str) -> Result<Box<dyn Storage>> {
+    fn instantiate_storage(backend: &str) -> Result<Arc<dyn Storage>> {
         match backend {
-            httpbucket::BACKEND_ID => Ok(Box::new(HttpBucketStorage::new()?)),
+            httpbucket::BACKEND_ID => Ok(Arc::new(HttpBucketStorage::new()?)),
             other => Err(anyhow!("unsupported backend '{other}'")),
         }
     }
@@ -705,6 +962,7 @@ mod tests {
     };
     use assert_fs::prelude::*;
     use httptest::Server;
+    use std::collections::HashSet;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -716,14 +974,122 @@ mod tests {
             m: 2,
             cache_gb: 4,
         }
-    }
+}
 
-    async fn init_fs(base: &Path) -> AegisFs {
+async fn init_fs(base: &Path) -> AegisFs {
         let home = HomePaths::new(base.to_path_buf());
         AegisFs::init(home.clone(), PASSWORD, defaults())
             .await
             .unwrap();
         AegisFs::load(home).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn plan_upload_creates_pending_records() {
+        let dir = tempdir().unwrap();
+        let fs = init_fs(dir.path()).await;
+
+        for name in ["alpha", "beta", "gamma"] {
+            fs.add_account(
+                PASSWORD,
+                name,
+                httpbucket::BACKEND_ID,
+                "https://example",
+                &format!("token-{name}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let payload = assert_fs::NamedTempFile::new("plan.bin").unwrap();
+        payload.write_binary(b"plan bytes").unwrap();
+
+        let file_id = "plan-file";
+        fs.pack(
+            PASSWORD,
+            PackOptions {
+                source: payload.path().to_path_buf(),
+                file_id: file_id.into(),
+                name: None,
+                k: Some(2),
+                m: Some(1),
+                compress: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let plan = fs.plan_upload(PASSWORD, file_id, None).await.unwrap();
+        assert_eq!(plan.len(), 3);
+        let mut seen = HashSet::new();
+        for shard in &plan {
+            assert!(seen.insert(shard.account_id));
+        }
+
+        let remotes = fs.db.list_remote_shards(file_id).await.unwrap();
+        assert_eq!(remotes.len(), 3);
+        assert!(remotes
+            .iter()
+            .all(|remote| remote.status == RemoteShardStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn plan_upload_respects_weights() {
+        let dir = tempdir().unwrap();
+        let fs = init_fs(dir.path()).await;
+
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            fs.add_account(
+                PASSWORD,
+                name,
+                httpbucket::BACKEND_ID,
+                "https://example",
+                &format!("token-{name}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let payload = assert_fs::NamedTempFile::new("weight.bin").unwrap();
+        payload.write_binary(b"weight bytes").unwrap();
+
+        let file_id = "weight-file";
+        fs.pack(
+            PASSWORD,
+            PackOptions {
+                source: payload.path().to_path_buf(),
+                file_id: file_id.into(),
+                name: None,
+                k: Some(2),
+                m: Some(1),
+                compress: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let baseline = fs
+            .plan_upload(PASSWORD, file_id, Some(0))
+            .await
+            .unwrap();
+        let baseline_accounts: Vec<String> = baseline
+            .iter()
+            .map(|entry| entry.account_name.clone())
+            .collect();
+
+        fs.set_account_weight(PASSWORD, "delta", 5).await.unwrap();
+
+        let weighted = fs
+            .plan_upload(PASSWORD, file_id, Some(0))
+            .await
+            .unwrap();
+        let weighted_accounts: Vec<String> = weighted
+            .iter()
+            .map(|entry| entry.account_name.clone())
+            .collect();
+
+        assert!(weighted_accounts.contains(&"delta".to_string()));
+        assert_ne!(baseline_accounts, weighted_accounts);
     }
 
     #[tokio::test]
@@ -1024,4 +1390,179 @@ mod tests {
         };
         fs.unpack(PASSWORD, unpack_opts).await.unwrap();
     }
+}
+
+async fn process_shard(
+    db: Database,
+    store: Arc<FileStore>,
+    semaphore: Arc<Semaphore>,
+    overall: ProgressBar,
+    runtime: Arc<AccountRuntime>,
+    file_id: String,
+    plan: PlacementPlanShard,
+    shard_meta: ShardInfo,
+) -> Result<()> {
+    let _permit = semaphore.acquire_owned().await?;
+    let shard_path = store.shard_path(&file_id, usize::from(plan.shard_index));
+    if !shard_path.exists() {
+        overall.inc(1);
+        db.set_remote_shard_status(&file_id, plan.shard_index, RemoteShardStatus::Missing)
+            .await?;
+        return Err(anyhow!(
+            "local shard {} missing; run pack before upload",
+            plan.shard_index
+        ));
+    }
+
+    db.set_remote_shard_status(&file_id, plan.shard_index, RemoteShardStatus::Uploading)
+        .await?;
+
+    let expected_size = u64::try_from(shard_meta.size).context("shard size overflow")?;
+    let storage = runtime.storage.clone();
+    let session = runtime.session.clone();
+    let limiter = runtime.limiter.clone();
+    let remote_hint = plan.remote_ref.clone();
+
+    let mut backoff = ExponentialBackoff {
+        initial_interval: Duration::from_millis(200),
+        max_interval: Duration::from_secs(5),
+        max_elapsed_time: Some(Duration::from_secs(120)),
+        randomization_factor: 0.2,
+        ..ExponentialBackoff::default()
+    };
+
+    let upload_result = retry(backoff.clone(), || {
+        let storage = storage.clone();
+        let session = session.clone();
+        let limiter = limiter.clone();
+        let shard_path = shard_path.clone();
+        let remote_hint = remote_hint.clone();
+        async move {
+            limiter.until_ready().await;
+            match storage.upload(&session, &shard_path, Some(&remote_hint)).await {
+                Ok(remote) => Ok(remote),
+                Err(err) => Err(classify_backoff(err)),
+            }
+        }
+    })
+    .await;
+
+    let remote_ref = match upload_result {
+        Ok(remote) => remote,
+        Err(BackoffError::Permanent(err) | BackoffError::Transient(err)) => {
+            error!(
+                file_id = %file_id,
+                shard = plan.shard_index,
+                "upload failed after retries: {err}"
+            );
+            db.set_remote_shard_status(&file_id, plan.shard_index, RemoteShardStatus::Missing)
+                .await?;
+            update_account_health(&db, &runtime, false, Some(&err.to_string())).await?;
+            overall.inc(1);
+            return Err(err);
+        }
+    };
+
+    let stat_result = retry(backoff, || {
+        let storage = storage.clone();
+        let session = session.clone();
+        let limiter = limiter.clone();
+        let remote_ref = remote_ref.clone();
+        async move {
+            limiter.until_ready().await;
+            match storage.stat(&session, &remote_ref).await {
+                Ok(meta) => Ok(meta),
+                Err(err) => Err(classify_backoff(err)),
+            }
+        }
+    })
+    .await;
+
+    let object_meta = match stat_result {
+        Ok(meta) => meta,
+        Err(BackoffError::Permanent(err) | BackoffError::Transient(err)) => {
+            error!(
+                file_id = %file_id,
+                shard = plan.shard_index,
+                "stat after upload failed: {err}"
+            );
+            db.set_remote_shard_status(&file_id, plan.shard_index, RemoteShardStatus::Missing)
+                .await?;
+            update_account_health(&db, &runtime, false, Some(&err.to_string())).await?;
+            overall.inc(1);
+            return Err(err);
+        }
+    };
+
+    let final_status = if object_meta.size == expected_size {
+        RemoteShardStatus::Ok
+    } else {
+        warn!(
+            file_id = %file_id,
+            shard = plan.shard_index,
+            expected = expected_size,
+            actual = object_meta.size,
+            "remote size mismatch"
+        );
+        RemoteShardStatus::Stale
+    };
+
+    let record = RemoteShardRecord {
+        file_id: file_id.clone(),
+        index: plan.shard_index,
+        account_id: plan.account_id,
+        remote_ref: remote_ref.locator.clone(),
+        size: object_meta.size,
+        etag: object_meta.etag.clone(),
+        status: final_status,
+    };
+    db.upsert_remote_shard(&record).await?;
+    update_account_health(&db, &runtime, final_status == RemoteShardStatus::Ok, None).await?;
+    overall.inc(1);
+    Ok(())
+}
+
+fn classify_backoff(err: anyhow::Error) -> BackoffError<anyhow::Error> {
+    if is_transient(&err) {
+        BackoffError::Transient(err)
+    } else {
+        BackoffError::Permanent(err)
+    }
+}
+
+fn is_transient(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(status) = cause.downcast_ref::<HttpStatusError>() {
+            if status.is_transient() {
+                return true;
+            }
+        }
+        if let Some(req_err) = cause.downcast_ref::<ReqwestError>() {
+            if req_err.is_timeout() || req_err.is_connect() || req_err.is_request() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+async fn update_account_health(
+    db: &Database,
+    runtime: &Arc<AccountRuntime>,
+    success: bool,
+    error: Option<&str>,
+) -> Result<()> {
+    let mut stats = runtime.stats.lock().await;
+    let mut rate = stats.success_rate.clamp(0.0, 1.0);
+    if success {
+        rate = (rate * 0.8_f64) + 0.2_f64;
+        stats.last_error = None;
+    } else {
+        rate = (rate * 0.5_f64).clamp(0.0, 1.0);
+        stats.last_error = error.map(ToOwned::to_owned);
+    }
+    stats.success_rate = rate;
+    db.update_account_health(runtime.record.id, rate, stats.last_error.as_deref())
+        .await?;
+    Ok(())
 }

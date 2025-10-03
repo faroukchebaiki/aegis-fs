@@ -1,3 +1,4 @@
+use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +189,9 @@ pub struct AccountRecord {
     pub backend: String,
     pub endpoint: String,
     pub token_ref: String,
+    pub weight: i64,
+    pub success_rate: f64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +202,53 @@ pub struct RemoteShardRecord {
     pub remote_ref: String,
     pub size: u64,
     pub etag: Option<String>,
+    pub status: RemoteShardStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteShardStatus {
+    Pending,
+    Uploading,
+    Ok,
+    Missing,
+    Stale,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlacementPlanShard {
+    pub shard_index: u8,
+    pub account_id: i64,
+    pub account_name: String,
+    pub remote_ref: String,
+    pub size: u64,
+}
+
+impl RemoteShardStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Uploading => "UPLOADING",
+            Self::Ok => "OK",
+            Self::Missing => "MISSING",
+            Self::Stale => "STALE",
+        }
+    }
+}
+
+impl TryFrom<&str> for RemoteShardStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "UPLOADING" => Ok(Self::Uploading),
+            "OK" => Ok(Self::Ok),
+            "MISSING" => Ok(Self::Missing),
+            "STALE" => Ok(Self::Stale),
+            other => Err(anyhow!("invalid shard status '{other}'")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
